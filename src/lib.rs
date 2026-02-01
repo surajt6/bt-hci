@@ -16,6 +16,9 @@ pub mod param;
 pub mod transport;
 pub use btuuid as uuid;
 
+#[cfg(feature = "btsnoop")]
+pub mod btsnoop;
+
 /// Errors from parsing HCI data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

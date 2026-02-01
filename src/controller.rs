@@ -17,6 +17,8 @@ use crate::event::{CommandComplete, CommandCompleteWithStatus, CommandStatus, Ev
 use crate::param::{RemainingBytes, Status};
 use crate::transport::Transport;
 use crate::{cmd, data, ControllerToHostPacket, FixedSizeValue, FromHciBytes, FromHciBytesError};
+#[cfg(feature = "btsnoop")]
+use crate::{btsnoop, HostToControllerPacket, WriteHci};
 
 pub mod blocking;
 
@@ -60,9 +62,52 @@ pub struct ExternalController<T, const SLOTS: usize> {
 impl<T, const SLOTS: usize> ExternalController<T, SLOTS> {
     /// Create a new instance.
     pub fn new(transport: T) -> Self {
+        #[cfg(feature = "btsnoop")]
+        btsnoop::log_file_header();
+
         Self {
             slots: ControllerState::new(),
             transport,
+        }
+    }
+}
+
+#[cfg(feature = "btsnoop")]
+impl<T, const SLOTS: usize> ExternalController<T, SLOTS> {
+    /// Log an outgoing packet (Host -> Controller)
+    #[inline]
+    fn log_outgoing<P: HostToControllerPacket + WriteHci>(&self, packet: &P) {
+        // Serialize packet to buffer: H4 type byte + packet data
+        let mut buf = [0u8; 260]; // Max HCI packet size + type byte
+        buf[0] = P::KIND as u8;
+        let mut cursor = btsnoop::SliceCursor::new(&mut buf[1..]);
+        let _ = packet.write_hci(&mut cursor);
+        let len = 1 + cursor.position();
+
+        btsnoop::log_packet(btsnoop::Direction::Sent, P::KIND, &buf[..len]);
+    }
+
+    /// Log an incoming packet (Controller -> Host)
+    ///
+    /// Takes the packet kind and length separately to avoid borrow conflicts,
+    /// since the parsed packet holds references into the buffer.
+    #[inline]
+    fn log_incoming_raw(&self, kind: crate::PacketKind, buf: &[u8], len: usize) {
+        btsnoop::log_packet(btsnoop::Direction::Received, kind, &buf[..len]);
+    }
+
+    /// Calculate the total length of an incoming packet in the buffer
+    #[inline]
+    fn calculate_incoming_packet_len(packet: &ControllerToHostPacket<'_>) -> usize {
+        match packet {
+            // Event: 1 (type) + 1 (code) + 1 (params_len) + data
+            ControllerToHostPacket::Event(e) => 1 + 2 + e.data.len(),
+            // ACL: 1 (type) + 4 (header) + data
+            ControllerToHostPacket::Acl(a) => 1 + 4 + a.data().len(),
+            // Sync: 1 (type) + 3 (header) + data
+            ControllerToHostPacket::Sync(s) => 1 + 3 + s.data().len(),
+            // ISO: 1 (type) + 4 (header) + data_load
+            ControllerToHostPacket::Iso(i) => 1 + 4 + i.data_load_len(),
         }
     }
 }
@@ -80,16 +125,22 @@ where
     T::Error: From<FromHciBytesError>,
 {
     async fn write_acl_data(&self, packet: &data::AclPacket<'_>) -> Result<(), Self::Error> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet).await?;
         Ok(())
     }
 
     async fn write_sync_data(&self, packet: &data::SyncPacket<'_>) -> Result<(), Self::Error> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet).await?;
         Ok(())
     }
 
     async fn write_iso_data(&self, packet: &data::IsoPacket<'_>) -> Result<(), Self::Error> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet).await?;
         Ok(())
     }
@@ -99,7 +150,21 @@ where
             {
                 // Safety: we will not hold references across loop iterations.
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
+                #[cfg(feature = "btsnoop")]
+                let buf_ptr = buf.as_ptr();
                 let value = self.transport.read(&mut buf[..]).await?;
+
+                // Log incoming packet before internal routing
+                #[cfg(feature = "btsnoop")]
+                {
+                    let kind = value.kind();
+                    let len = Self::calculate_incoming_packet_len(&value);
+                    // Safety: we only read from the buffer for logging, the data is valid
+                    // since transport.read() filled it, and we're not modifying it.
+                    let log_buf = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+                    self.log_incoming_raw(kind, log_buf, len);
+                }
+
                 match value {
                     ControllerToHostPacket::Event(ref event) => match event.kind {
                         EventKind::CommandComplete => {
@@ -179,16 +244,22 @@ where
     }
 
     fn try_write_acl_data(&self, packet: &data::AclPacket<'_>) -> Result<(), blocking::TryError<Self::Error>> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet)?;
         Ok(())
     }
 
     fn try_write_sync_data(&self, packet: &data::SyncPacket<'_>) -> Result<(), blocking::TryError<Self::Error>> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet)?;
         Ok(())
     }
 
     fn try_write_iso_data(&self, packet: &data::IsoPacket<'_>) -> Result<(), blocking::TryError<Self::Error>> {
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(packet);
         self.transport.write(packet)?;
         Ok(())
     }
@@ -198,7 +269,21 @@ where
             {
                 // Safety: we will not hold references across loop iterations.
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
+                #[cfg(feature = "btsnoop")]
+                let buf_ptr = buf.as_ptr();
                 let value = self.transport.read(&mut buf[..])?;
+
+                // Log incoming packet before internal routing
+                #[cfg(feature = "btsnoop")]
+                {
+                    let kind = value.kind();
+                    let len = Self::calculate_incoming_packet_len(&value);
+                    // Safety: we only read from the buffer for logging, the data is valid
+                    // since transport.read() filled it, and we're not modifying it.
+                    let log_buf = unsafe { core::slice::from_raw_parts(buf_ptr, len) };
+                    self.log_incoming_raw(kind, log_buf, len);
+                }
+
                 match value {
                     ControllerToHostPacket::Event(ref event) => match event.kind {
                         EventKind::CommandComplete => {
@@ -240,12 +325,13 @@ where
     async fn exec(&self, cmd: &C) -> Result<C::Return, cmd::Error<Self::Error>> {
         let mut retval: C::ReturnBuf = C::ReturnBuf::new();
 
-        //info!("Executing command with opcode {}", C::OPCODE);
         let (slot, idx) = self.slots.acquire(C::OPCODE, retval.as_mut()).await;
         let _d = OnDrop::new(|| {
             self.slots.release_slot(idx);
         });
 
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(cmd);
         self.transport.write(cmd).await.map_err(cmd::Error::Io)?;
 
         let result = slot.wait().await;
@@ -257,7 +343,6 @@ where
             return_param_bytes,
         };
         let r = e.to_result::<C>().map_err(cmd::Error::Hci)?;
-        // info!("Done executing command with opcode {}", C::OPCODE);
         Ok(r)
     }
 }
@@ -274,6 +359,8 @@ where
             self.slots.release_slot(idx);
         });
 
+        #[cfg(feature = "btsnoop")]
+        self.log_outgoing(cmd);
         self.transport.write(cmd).await.map_err(cmd::Error::Io)?;
 
         let result = slot.wait().await;
